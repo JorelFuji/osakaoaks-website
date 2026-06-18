@@ -1,0 +1,26 @@
+# Add this to your ~/.ssh/config file for Cursor Remote SSH
+
+Host osakaoaks-prod
+    HostName osakaoaks.org
+    User osakuqbj
+    Port 21098
+    IdentityFile ~/.ssh/rsa_prod_deploy
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+Host osakaoaks-dev
+    HostName osakaoaks.org
+    User osakuqbj
+    Port 21098
+    IdentityFile ~/.ssh/rsa_dev_deploy
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+# Alternative: use the same key for both
+Host osakaoaks
+    HostName osakaoaks.org
+    User osakuqbj
+    Port 21098
+    IdentityFile ~/.ssh/vs-code
+    ServerAliveInterval 60
+    ServerAliveCountMax 3

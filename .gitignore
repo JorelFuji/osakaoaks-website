@@ -1,0 +1,35 @@
+# WordPress
+wp-config.php
+wp-content/uploads/
+wp-content/cache/
+wp-content/backup*/
+wp-content/upgrade/
+wp-content/advanced-cache.php
+wp-content/wp-cache-config.php
+
+# SSH Keys (NEVER commit these)
+*.pem
+*.key
+*_rsa*
+*.ppk
+
+# cPanel
+.cpanel/
+.ssh/
+.trash/
+.cpanm/
+.vscode-server/
+
+# System
+.DS_Store
+Thumbs.db
+*.log
+.env
+.htpasswd
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
