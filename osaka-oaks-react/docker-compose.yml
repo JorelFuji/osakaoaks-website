@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: osaka-oaks-web:latest
+    container_name: osaka-oaks-web
+    ports:
+      - "80:80"
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - osaka-oaks-network
+    labels:
+      - "com.osaka-oaks.description=Osaka Oaks Frontend"
+      - "com.osaka-oaks.department=Engineering"
+      - "com.osaka-oaks.component=frontend"
+
+networks:
+  osaka-oaks-network:
+    driver: bridge

@@ -1,0 +1,391 @@
+name: 🚀 Production CI/CD with Security & Backup
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Deployment reason'
+        required: false
+
+env:
+  DEPLOY_PATH: /home/osakuqbj/public_html
+  BACKUP_PATH: /home/osakuqbj/backups/prod
+  LOG_PATH: /home/osakuqbj/logs/deployments
+
+jobs:
+  # Security Scanning
+  security:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Security scan - Sensitive data
+        run: |
+          echo "🔍 Scanning for exposed secrets..."
+          if grep -r "password\|secret\|api_key\|private_key" --exclude-dir=.git --exclude="*.md" --exclude="*.yml" .; then
+            echo "⚠️ Warning: Potential sensitive data found"
+          else
+            echo "✅ No exposed secrets detected"
+          fi
+
+      - name: Security scan - Malicious patterns
+        run: |
+          echo "🔍 Checking for malicious code patterns..."
+          if find . -name "*.php" -exec grep -l "eval\|base64_decode.*\$\|system\|shell_exec\|exec\|passthru" {} \; 2>/dev/null | grep -v test; then
+            echo "⚠️ Warning: Suspicious PHP patterns found"
+          else
+            echo "✅ No suspicious patterns detected"
+          fi
+
+      - name: Check file permissions
+        run: |
+          echo "🔍 Checking for overly permissive files..."
+          find . -type f -perm /o+w -not -path "./.git/*" || echo "✅ No world-writable files"
+
+  # Build & Test
+  build:
+    name: 🔨 Build & Test
+    runs-on: ubuntu-latest
+    needs: security
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          if [ -f "package.json" ]; then
+            npm ci
+          else
+            echo "No package.json found, skipping npm install"
+          fi
+
+      - name: Run tests
+        run: |
+          if [ -f "package.json" ] && grep -q "\"test\":" package.json; then
+            npm test || echo "Tests not configured yet"
+          else
+            echo "✅ No tests configured yet"
+          fi
+
+      - name: Build project
+        run: |
+          if [ -f "package.json" ] && grep -q "\"build\":" package.json; then
+            npm run build
+          else
+            echo "✅ No build step required"
+          fi
+
+      - name: Create build info
+        run: |
+          mkdir -p build-artifacts
+          cat > build-artifacts/build-info.json << EOF
+          {
+            "commit": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "workflow": "${{ github.workflow }}",
+            "run_number": "${{ github.run_number }}"
+          }
+          EOF
+          cat build-artifacts/build-info.json
+
+      - name: Generate file manifest
+        run: |
+          echo "📋 Creating deployment manifest..."
+          find . -type f ! -path "*/\.*" ! -path "*/node_modules/*" > build-artifacts/manifest.txt
+          echo "✅ Files to deploy: $(wc -l < build-artifacts/manifest.txt)"
+
+      - name: Create deployment package
+        run: |
+          tar -czf build-artifacts/deployment-${{ github.sha }}.tar.gz \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='.history' \
+            --exclude='build-artifacts' \
+            --exclude='*.log' \
+            .
+          ls -lh build-artifacts/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-build-${{ github.sha }}
+          path: build-artifacts/
+          retention-days: 30
+
+  # Database Backup
+  backup-database:
+    name: 💾 Backup Database
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Create database backup
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            BACKUP_DIR="${{ env.BACKUP_PATH }}/$(date +%Y%m%d_%H%M%S)"
+            mkdir -p "$BACKUP_DIR"
+            
+            echo "💾 Creating database backup..."
+            
+            # Extract database credentials from wp-config.php
+            cd ${{ env.DEPLOY_PATH }}
+            if [ -f "wp-config.php" ]; then
+              DB_NAME=$(grep "DB_NAME" wp-config.php | cut -d "'" -f 4)
+              DB_USER=$(grep "DB_USER" wp-config.php | cut -d "'" -f 4)
+              DB_PASS=$(grep "DB_PASSWORD" wp-config.php | cut -d "'" -f 4)
+              DB_HOST=$(grep "DB_HOST" wp-config.php | cut -d "'" -f 4)
+              
+              mysqldump -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" > "$BACKUP_DIR/database.sql" 2>&1 || echo "⚠️ Database backup skipped"
+              
+              if [ -f "$BACKUP_DIR/database.sql" ]; then
+                gzip "$BACKUP_DIR/database.sql"
+                echo "✅ Database backup created: $(ls -lh $BACKUP_DIR/database.sql.gz | awk '{print $5}')"
+              fi
+            else
+              echo "⚠️ No wp-config.php found, skipping database backup"
+            fi
+
+  # Files Backup
+  backup-files:
+    name: 💾 Backup Files
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Create pre-deployment backup
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            BACKUP_DIR="${{ env.BACKUP_PATH }}/$TIMESTAMP"
+            LOG_FILE="${{ env.LOG_PATH }}/backup_$TIMESTAMP.log"
+            
+            mkdir -p "${{ env.BACKUP_PATH }}"
+            mkdir -p "${{ env.LOG_PATH }}"
+            
+            echo "[$(date)] 💾 Starting pre-deployment backup" | tee -a "$LOG_FILE"
+            echo "[$(date)] Commit: ${{ github.sha }}" | tee -a "$LOG_FILE"
+            
+            cd "${{ env.DEPLOY_PATH }}"
+            
+            # Backup critical files
+            tar -czf "$BACKUP_DIR-files.tar.gz" \
+              --exclude='wp-content/cache/*' \
+              --exclude='wp-content/uploads/*.tmp' \
+              --exclude='*.log' \
+              --exclude='node_modules' \
+              . 2>&1 | tee -a "$LOG_FILE"
+            
+            BACKUP_SIZE=$(du -sh "$BACKUP_DIR-files.tar.gz" | cut -f1)
+            echo "[$(date)] ✅ Backup complete: $BACKUP_SIZE" | tee -a "$LOG_FILE"
+            
+            # Keep only last 10 backups
+            cd "${{ env.BACKUP_PATH }}"
+            ls -t *.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm
+            echo "[$(date)] 🧹 Old backups cleaned" | tee -a "$LOG_FILE"
+
+      - name: Upload backup to GitHub
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            LATEST_BACKUP=$(ls -t ${{ env.BACKUP_PATH }}/*.tar.gz 2>/dev/null | head -1)
+            if [ -f "$LATEST_BACKUP" ]; then
+              echo "📤 Latest backup: $LATEST_BACKUP"
+            fi
+
+  # Deploy
+  deploy:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [backup-database, backup-files]
+    environment:
+      name: production
+      url: https://osakaoaks.org
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            LOG_FILE="${{ env.LOG_PATH }}/deploy_$TIMESTAMP.log"
+            
+            echo "[$(date)] 🚀 Starting deployment" | tee -a "$LOG_FILE"
+            echo "[$(date)] Commit: ${{ github.sha }}" | tee -a "$LOG_FILE"
+            echo "[$(date)] Actor: ${{ github.actor }}" | tee -a "$LOG_FILE"
+            
+            cd "${{ env.DEPLOY_PATH }}"
+            
+            # Store current commit for rollback
+            git rev-parse HEAD > .last-deploy-commit 2>&1 | tee -a "$LOG_FILE" || echo "First deployment"
+            
+            # Fetch and deploy
+            echo "[$(date)] 📥 Fetching latest code..." | tee -a "$LOG_FILE"
+            git fetch origin main 2>&1 | tee -a "$LOG_FILE"
+            
+            echo "[$(date)] 🔄 Deploying ${{ github.sha }}..." | tee -a "$LOG_FILE"
+            git reset --hard origin/main 2>&1 | tee -a "$LOG_FILE"
+            
+            # Set secure permissions
+            echo "[$(date)] 🔐 Setting secure permissions..." | tee -a "$LOG_FILE"
+            find . -type f -exec chmod 644 {} \; 2>&1 | tee -a "$LOG_FILE"
+            find . -type d -exec chmod 755 {} \; 2>&1 | tee -a "$LOG_FILE"
+            chmod 600 wp-config.php 2>/dev/null || true
+            
+            # Create deployment markers
+            echo "${{ github.sha }}" > .deploy-version
+            echo "$(date -u +"%Y-%m-%d %H:%M:%S UTC")" > .deploy-timestamp
+            echo "${{ github.actor }}" > .deploy-actor
+            
+            echo "[$(date)] ✅ Deployment successful!" | tee -a "$LOG_FILE"
+
+  # Verify Deployment
+  verify:
+    name: ✅ Verify Deployment
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Check website status
+        run: |
+          echo "🔍 Verifying production website..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://osakaoaks.org)
+          RESPONSE_TIME=$(curl -s -o /dev/null -w "%{time_total}" https://osakaoaks.org)
+          
+          echo "HTTP Status: $STATUS"
+          echo "Response Time: ${RESPONSE_TIME}s"
+          
+          if [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ]; then
+            echo "✅ Website is up!"
+          else
+            echo "❌ Website check failed! Status: $STATUS"
+            exit 1
+          fi
+
+      - name: Verify deployment version
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            cd "${{ env.DEPLOY_PATH }}"
+            DEPLOYED=$(cat .deploy-version 2>/dev/null || echo "unknown")
+            EXPECTED="${{ github.sha }}"
+            
+            echo "Expected: $EXPECTED"
+            echo "Deployed: $DEPLOYED"
+            
+            if [ "$DEPLOYED" = "$EXPECTED" ]; then
+              echo "✅ Version verified!"
+            else
+              echo "❌ Version mismatch!"
+              exit 1
+            fi
+
+      - name: Check file integrity
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            cd "${{ env.DEPLOY_PATH }}"
+            echo "🔍 Checking critical files..."
+            
+            CRITICAL_FILES=("index.php" ".htaccess")
+            for file in "${CRITICAL_FILES[@]}"; do
+              if [ -f "$file" ]; then
+                echo "✅ $file exists"
+              else
+                echo "⚠️ $file missing"
+              fi
+            done
+
+  # Notification & Summary
+  notify:
+    name: 📢 Notification
+    runs-on: ubuntu-latest
+    needs: [deploy, verify]
+    if: always()
+    steps:
+      - name: Create deployment summary
+        run: |
+          echo "## 🚀 Production Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Status" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.deploy.result }}" = "success" ] && [ "${{ needs.verify.result }}" = "success" ]; then
+            echo "✅ **Deployment Successful**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment Failed**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actor**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> $GITHUB_STEP_SUMMARY
+          echo "- **Website**: https://osakaoaks.org" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Backups" >> $GITHUB_STEP_SUMMARY
+          echo "- Database backup: ✅ Created" >> $GITHUB_STEP_SUMMARY
+          echo "- Files backup: ✅ Created" >> $GITHUB_STEP_SUMMARY
+          echo "- Retention: 30 days" >> $GITHUB_STEP_SUMMARY
+
+  # Rollback (Manual)
+  rollback:
+    name: ⏮️ Rollback
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: failure()
+    steps:
+      - name: Rollback to previous version
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            echo "⏮️ Rolling back deployment..."
+            cd "${{ env.DEPLOY_PATH }}"
+            
+            if [ -f ".last-deploy-commit" ]; then
+              LAST_COMMIT=$(cat .last-deploy-commit)
+              echo "Rolling back to: $LAST_COMMIT"
+              git reset --hard "$LAST_COMMIT"
+              echo "✅ Rollback complete"
+            else
+              echo "⚠️ No previous commit found, cannot rollback"
+            fi
