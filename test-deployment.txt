@@ -1,0 +1,10 @@
+✅ DEV DEPLOYMENT TEST
+
+This file was created to test the automated deployment pipeline.
+
+Timestamp: 2026-06-18 13:54
+Branch: dev
+Target: jarrelspiller.osakaoaks.org
+
+If you can see this file at https://jarrelspiller.osakaoaks.org/test-deployment.txt
+then the automated deployment is working correctly!
